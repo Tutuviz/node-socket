@@ -16,7 +16,8 @@ const db = new Database("db.sqlite");
 const app = express();
 app.use(express.json());
 
-const PORT_RANGE_START = 3000;
+const SERVER_PORT = 3000;
+const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3100;
 
 const jsonFilePath = 'servers.json';
@@ -249,11 +250,36 @@ function getRoles(type) {
 function start() {
   const servers = getAll();
 
+  const args = process.argv.slice(2);
+
+  const role = args[0] ? args[0] : Math.random() < 0.5 ? 'seller' : 'manager';
+
+  const mainServerIndex = servers.findIndex((server) => server.port === SERVER_PORT);
+
+  if (role === "main_server" && servers[mainServerIndex]?.deactivated === false) {
+    console.error('Main Server already running');
+    process.exit(1);
+  }
+
+  if (mainServerIndex < 0 || role === "main_server") {
+    getRoles("server");
+
+    if (mainServerIndex >= 0) {
+      removeFromJson(servers[mainServerIndex].id)
+    }
+
+    return {
+      id: "main",
+      type: "server",
+      port: SERVER_PORT,
+    };
+  }
+
   // TODO: remove empty ports?
 
   let nextPort = PORT_RANGE_START;
   while (nextPort <= PORT_RANGE_END) {
-    if (!servers.find((server) => server.port === nextPort.toString())) {
+    if (!servers.find((server) => server.port === nextPort)) {
       break;
     }
     nextPort++;
@@ -264,10 +290,6 @@ function start() {
     process.exit(1);
   }
 
-  const args = process.argv.slice(2);
-
-  const role = args[0] ?? Math.random() < 0.5 ? 'seller' : 'manager';
-
   const id = faker.person.firstName()
 
   getRoles(role);
@@ -275,7 +297,7 @@ function start() {
   return {
     id: id,
     type: role,
-    port: nextPort.toString(),
+    port: nextPort,
   };
 }
 
@@ -293,12 +315,8 @@ async function electServer() {
         console.log(`Server ${client.port} is up and turned into server`);
         elected = true
       })
-      .catch((err) => {
-        // console.error(err);
-        // add retry?
+      .catch(() => {
         console.log(`Server ${client.port} is down`);
-
-        removeFromJson(client.id)
       });
 
     if (elected) {
@@ -309,7 +327,7 @@ async function electServer() {
 }
 
 async function getServer() {
-  const server = await getAll().find((server) => server.type === "server");
+  const server = await getAll().find((server) => server.type === "server" && !server.deactivated);
   try {
     await axios.get(`http://localhost:${server.port}/ping`)
 
@@ -329,9 +347,59 @@ const thisServer = start();
 function becomeServer() {
   const servers = getAll();
 
-  const index = servers.findIndex((server) => server.id === thisServer.id);
-
   getRoles("server");
+
+  for (const client of servers) {
+    console.log(`pinging ${client.id}`)
+    axios.get(`http://localhost:${client.port}/ping`)
+      .catch(() => {
+        console.log(`Server ${client.port} is down`);
+
+        if (client.port !== SERVER_PORT) {
+          removeFromJson(client.id)
+        }
+      });
+  }
+
+  const mainServerIndex = servers.findIndex((server) => server.port === SERVER_PORT);
+
+  if (mainServerIndex >= 0) {
+    servers[mainServerIndex] = {
+      ...servers[mainServerIndex],
+      deactivated: true
+    };
+
+    const getMainServerConnection = setInterval(async () => {
+      console.log("Getting main server! 🦆")
+
+      axios.get(`http://localhost:${SERVER_PORT}/ping`)
+        .then(() => {
+          console.log("Main Server became responsive");
+
+          const newServers = getAll();
+
+          const index = newServers.findIndex((server) => server.type === "server" && server.port !== SERVER_PORT);
+          const newServerIndex = newServers.findIndex(server => server.port === SERVER_PORT);
+
+          newServers[index] = thisServer;
+          newServers[newServerIndex] = {
+            ...newServers[newServerIndex],
+            deactivated: false
+          };
+
+          getRoles(thisServer.type)
+
+          fs.writeFileSync(jsonFilePath, JSON.stringify(newServers, null, 2));
+        })
+        .catch(() => {
+          console.log(`Server ${SERVER_PORT} is still down`);
+        });
+    }, 10000);
+
+    roleFunctions.push(getMainServerConnection);
+  }
+
+  const index = servers.findIndex((server) => server.id === thisServer.id);
 
   servers[index] = {
     id: uuidv4(),
